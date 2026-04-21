@@ -1,0 +1,14 @@
+{
+  "name": "live-translation-server",
+  "version": "1.0.0",
+  "description": "WebSocket server — receives webm/opus audio chunks, echo placeholder, backpressure queue. No external tools.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "fastify": "^4.28.1",
+    "@fastify/websocket": "^10.0.1"
+  }
+}

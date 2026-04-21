@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Live Translation</title>
+  <style>
+    /* ── Reset & base ──────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 320px;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 13px;
+      background: #0f0f1a;
+      color: #e2e8f0;
+      padding: 16px;
+      line-height: 1.5;
+    }
+
+    /* ── Header ────────────────────────────────────────────────────────────── */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #1e1e3a;
+    }
+
+    .header h1 {
+      font-size: 15px;
+      font-weight: 700;
+      color: #a78bfa;
+      letter-spacing: 0.3px;
+    }
+
+    /* ── Connection status ─────────────────────────────────────────────────── */
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .status-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      transition: background 0.3s;
+    }
+
+    .status-dot.connected    { background: #22c55e; box-shadow: 0 0 6px #22c55e88; }
+    .status-dot.disconnected { background: #ef4444; box-shadow: 0 0 6px #ef444488; }
+
+    #status-text.connected    { color: #22c55e; }
+    #status-text.disconnected { color: #ef4444; }
+
+    /* ── Card ──────────────────────────────────────────────────────────────── */
+    .card {
+      background: #1a1a2e;
+      border: 1px solid #2a2a4a;
+      border-radius: 10px;
+      padding: 14px;
+      margin-bottom: 12px;
+    }
+
+    .card-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: #7c7ca8;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      margin-bottom: 10px;
+    }
+
+    /* ── Toggle switch ─────────────────────────────────────────────────────── */
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .toggle-label {
+      font-size: 13px;
+      color: #e2e8f0;
+      font-weight: 500;
+    }
+
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 44px;
+      height: 24px;
+      flex-shrink: 0;
+    }
+
+    .switch input { opacity: 0; width: 0; height: 0; }
+
+    .slider {
+      position: absolute;
+      inset: 0;
+      background: #2a2a4a;
+      border-radius: 24px;
+      cursor: pointer;
+      transition: background 0.25s;
+    }
+
+    .slider::before {
+      content: '';
+      position: absolute;
+      width: 18px;
+      height: 18px;
+      left: 3px;
+      top: 3px;
+      background: #6b6b99;
+      border-radius: 50%;
+      transition: transform 0.25s, background 0.25s;
+    }
+
+    .switch input:checked + .slider { background: #7c3aed; }
+    .switch input:checked + .slider::before { transform: translateX(20px); background: #fff; }
+
+    /* ── Pitch control ─────────────────────────────────────────────────────── */
+    .pitch-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+
+    .pitch-value {
+      font-size: 13px;
+      font-weight: 600;
+      color: #a78bfa;
+      min-width: 80px;
+      text-align: right;
+    }
+
+    input[type="range"] {
+      -webkit-appearance: none;
+      width: 100%;
+      height: 4px;
+      border-radius: 4px;
+      background: #2a2a4a;
+      outline: none;
+      cursor: pointer;
+    }
+
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #7c3aed;
+      cursor: pointer;
+      box-shadow: 0 0 0 3px #3b1fa044;
+      transition: box-shadow 0.2s;
+    }
+
+    input[type="range"]::-webkit-slider-thumb:hover {
+      box-shadow: 0 0 0 5px #7c3aed44;
+    }
+
+    /* ── Latency rows ──────────────────────────────────────────────────────── */
+    .latency-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 5px 0;
+      border-bottom: 1px solid #1e1e3a;
+    }
+
+    .latency-row:last-child { border-bottom: none; }
+
+    .latency-label {
+      font-size: 12px;
+      color: #7c7ca8;
+    }
+
+    .latency-value {
+      font-size: 13px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      min-width: 52px;
+      text-align: right;
+    }
+
+    /* Colour coding */
+    .latency-value.good   { color: #22c55e; }
+    .latency-value.medium { color: #f59e0b; }
+    .latency-value.bad    { color: #ef4444; }
+    .latency-value.none   { color: #4a4a6a; }
+
+    /* ── Footer ────────────────────────────────────────────────────────────── */
+    .footer {
+      text-align: center;
+      font-size: 10px;
+      color: #3a3a5a;
+      margin-top: 4px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <h1>⚡ Live Translation</h1>
+    <div class="status">
+      <div class="status-dot disconnected" id="status-dot"></div>
+      <span class="disconnected" id="status-text">Not connected</span>
+    </div>
+  </div>
+
+  <!-- Enable/Disable card -->
+  <div class="card">
+    <div class="card-title">Voice Processing</div>
+    <div class="toggle-row">
+      <span class="toggle-label">Enable voice processing</span>
+      <label class="switch">
+        <input type="checkbox" id="toggle-checkbox" />
+        <span class="slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <!-- Pitch control card -->
+  <div class="card">
+    <div class="card-title">Pitch Shift</div>
+    <div class="pitch-row">
+      <span class="toggle-label">Pitch shift</span>
+      <span class="pitch-value" id="pitch-display">0 semitones</span>
+    </div>
+    <input
+      type="range"
+      id="pitch-slider"
+      min="-5"
+      max="5"
+      step="1"
+      value="0"
+    />
+  </div>
+
+  <!-- Latency card -->
+  <div class="card">
+    <div class="card-title">Latency</div>
+
+    <div class="latency-row">
+      <span class="latency-label">Extension → Server</span>
+      <span class="latency-value none" id="lat-network-in">--</span>
+    </div>
+
+    <div class="latency-row">
+      <span class="latency-label">Server processing</span>
+      <span class="latency-value none" id="lat-processing">--</span>
+    </div>
+
+    <div class="latency-row">
+      <span class="latency-label">Server → Extension</span>
+      <span class="latency-value none" id="lat-network-out">--</span>
+    </div>
+
+    <div class="latency-row">
+      <span class="latency-label" style="color: #e2e8f0; font-weight:600;">Total round trip</span>
+      <span class="latency-value none" id="lat-total">--</span>
+    </div>
+  </div>
+
+  <div class="footer">Live Translation v1.0</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

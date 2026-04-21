@@ -1,0 +1,17 @@
+{
+  "name": "live-translation",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "server",
+    "dashboard"
+  ],
+  "scripts": {
+    "dev": "concurrently --names \"SERVER,DASHBOARD\" --prefix-colors \"blue,green\" \"npm run dev --workspace=server\" \"npm run dev --workspace=dashboard\"",
+    "install:all": "npm install && npm install --workspace=server && npm install --workspace=dashboard",
+    "start": "concurrently --names \"SERVER,DASHBOARD\" --prefix-colors \"blue,green\" \"npm run start --workspace=server\" \"npm run start --workspace=dashboard\""
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
