@@ -5,278 +5,407 @@
  * context as Google Meet. This is the only context where a getUserMedia
  * override actually intercepts Meet's mic call.
  *
- * This file is injected via a <script> tag created by content.js.
- * It cannot use any Chrome extension APIs (no chrome.runtime, no chrome.storage).
- * The only communication channel with content.js is window.postMessage.
+ * Architecture: Insertable Streams (MediaStreamTrackProcessor + Generator)
+ * ─────────────────────────────────────────────────────────────────────────
+ * Previous approach (AudioContext + MediaStreamDestinationNode) failed because
+ * Meet's Audio Worklet reads from the underlying hardware track, bypassing
+ * whatever Web Audio nodes we built on top. The Insertable Streams API
+ * intercepts at the track level — we are IN the signal chain, not beside it.
  *
- * Responsibilities:
- *   1. Override navigator.mediaDevices.getUserMedia BEFORE Meet calls it
- *   2. When Meet requests audio: get the real stream, build the Web Audio graph,
- *      create a fake MediaStream, return it to Meet
- *   3. Notify content.js via postMessage that the mic stream is ready
- *   4. Listen for commands from content.js via postMessage:
- *        { source: 'lt-content', type: 'startRecording' }
- *        { source: 'lt-content', type: 'stopRecording' }
- *        { source: 'lt-content', type: 'setPitch', pitch: N }
- *        { source: 'lt-content', type: 'playChunk', chunkId, data: base64 }
+ * Pipeline:
+ *   Real mic hardware
+ *     → MediaStreamTrackProcessor  (exposes raw AudioData frames)
+ *     → manual reader loop         (our control point)
+ *       OFF: enqueue mic frame unchanged → generator
+ *       ON:  accumulate samples → send PCM to server every 250ms
+ *            pass-through mic while waiting for server audio
+ *            when server audio arrives: write processed frames instead
+ *     → MediaStreamTrackGenerator  (produces real MediaStreamTrack)
+ *     → new MediaStream([generator.track]) returned to Meet
+ *     → Meet's Audio Worklet reads generator.track
+ *     → WebRTC → other participants
+ *
+ * This file injects via <script> tag from content.js.
+ * Cannot use any Chrome extension APIs — window.postMessage only.
  *
  * Message protocol:
- *   Messages FROM injected.js TO content.js have:  { source: 'lt-injected', type, ...payload }
- *   Messages FROM content.js TO injected.js have:  { source: 'lt-content',  type, ...payload }
+ *   FROM injected.js → content.js:  { source: 'lt-injected', type, ...payload }
+ *   FROM content.js  → injected.js: { source: 'lt-content',  type, ...payload }
  *
- * All console.log calls are prefixed with [LT Injected] for easy filtering.
+ * All console.log calls prefixed with [LT Injected] for easy filtering.
  */
 
 (function () {
   'use strict';
 
-  console.log('[LT Injected] Main world script loaded — installing getUserMedia override');
+  console.log('[LT Injected] Main world script loaded — Insertable Streams edition');
 
   // ─── State ──────────────────────────────────────────────────────────────────
 
-  let audioContext      = null;  // AudioContext for the whole Web Audio graph
-  let destinationNode   = null;  // MediaStreamDestinationNode — the fake mic stream
-  let realMicStream     = null;  // The real hardware MediaStream from the browser
-  let mediaRecorder     = null;  // MediaRecorder capturing the real mic in chunks
-  let processingEnabled = false; // Whether to send audio chunks to content.js
-  let currentPitch      = 0;     // Current semitone pitch shift
+  let processor         = null;  // MediaStreamTrackProcessor
+  let generator         = null;  // MediaStreamTrackGenerator
+  let writer            = null;  // generator.writable.getWriter()
+  let clonedTrack       = null;  // clone of real mic track given to processor
 
-  // ─── Choose Recording Format ───────────────────────────────────────────────
-  //
-  // We always want audio/webm;codecs=opus:
-  //   — Chrome's MediaRecorder produces it natively at ~5KB per 250ms chunk
-  //   — Deepgram's Streaming STT API accepts it directly (no conversion)
-  //   — 10× smaller than uncompressed PCM (audio/webm;codecs=pcm)
-  //   — The standard codec of WebRTC: Meet, Zoom, Discord all use Opus
-  //
-  // We do NOT want audio/webm;codecs=pcm — it is 10× larger, the server
-  // cannot process it without a codec library, and Deepgram does not list
-  // it as a supported input format.
-  let MIME_TYPE = 'audio/webm;codecs=opus';
-  if (!MediaRecorder.isTypeSupported(MIME_TYPE)) {
-    console.warn('[LT Injected] audio/webm;codecs=opus not supported — falling back to audio/webm');
-    MIME_TYPE = 'audio/webm'; // Chrome default, still almost always opus
+  // Pipeline lifecycle guards — prevent duplicate setup when Meet calls
+  // getUserMedia multiple times (4+ calls during call setup are normal).
+  let pipelineReady   = null;  // Promise<void> that resolves when pipeline is running
+  let pipelineStarted = false; // true once runPipeline() has been called
+
+  let processingEnabled = false; // toggled by startRecording / stopRecording
+  let currentPitch      = 0;     // semitones (forwarded to server, preserved for future use)
+
+  // ─── Sample accumulation ────────────────────────────────────────────────────
+  // AudioData frames are ~128 samples each (~2.7ms at 48kHz).
+  // We accumulate 12000 samples (250ms) before sending one WebSocket message.
+  // This matches Deepgram's streaming API timing and avoids 375 msg/sec overhead.
+
+  let accumBuffer  = [];    // array of Float32Arrays waiting to be sent
+  let accumCount   = 0;     // total samples accumulated so far
+  const CHUNK_SAMPLES = 12000; // 250ms × 48000 Hz
+  let chunkCounter = 0;
+
+  // ─── Playback state ─────────────────────────────────────────────────────────
+
+  let playingProcessed = false; // true when writing server audio frames to generator
+  let processedQueue   = [];    // queue of AudioData frames from server, ready to write
+  let currentTimestamp = 0;     // running microsecond timestamp (from latest AudioData)
+
+  // ─── Feature Detection ───────────────────────────────────────────────────────
+
+  const INSERTABLE_STREAMS_SUPPORTED =
+    ('MediaStreamTrackProcessor' in window) &&
+    ('MediaStreamTrackGenerator' in window);
+
+  if (!INSERTABLE_STREAMS_SUPPORTED) {
+    console.error('[LT Injected] Insertable Streams NOT supported in this browser — ' +
+      'falling back to simple pass-through. Audio processing will not work.');
+  } else {
+    console.log('[LT Injected] Insertable Streams supported ✓');
   }
-  console.log('[LT Injected] Using MIME type:', MIME_TYPE);
 
+  // ─── getUserMedia Override ───────────────────────────────────────────────────
 
-
-  // ─── getUserMedia Override ─────────────────────────────────────────────────
-
-  // Capture the original BEFORE any other code (including Meet) can touch it.
-  // .bind() preserves the correct `this` context when we call it later.
-  const originalGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+  const originalGetUserMedia =
+    navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
 
   navigator.mediaDevices.getUserMedia = async function (constraints) {
-    console.log('[LT Injected] getUserMedia intercepted — constraints:', JSON.stringify(constraints));
+    console.log('[LT Injected] getUserMedia intercepted:', JSON.stringify(constraints));
 
-    // Non-audio requests (video-only, screen share, etc.) pass through unchanged
+    // Non-audio requests (video-only, screen share) always pass through.
     if (!constraints || !constraints.audio) {
-      console.log('[LT Injected] Non-audio constraints — passing through to original');
+      console.log('[LT Injected] Non-audio request — passing through unchanged');
       return originalGetUserMedia(constraints);
     }
 
-    // ── Step 1: Get the real microphone stream ─────────────────────────────
+    // ── Guard 1: pipeline already fully running ───────────────────────────────
+    // Meet calls getUserMedia 4+ times during call setup (codec negotiation,
+    // reconnects, permission re-checks). Creating a new processor/generator
+    // for each call would consume the mic track multiple times and cause
+    // Chrome to throw a microphone conflict error.
+    if (generator) {
+      console.log('[LT Injected] getUserMedia called again — pipeline already active, ' +
+        'returning existing generator track');
+      return new MediaStream([generator.track]);
+    }
+
+    // ── Guard 2: pipeline is being set up (race condition) ────────────────────
+    // If getUserMedia fires a second time while the first call is still in
+    // the async setupPipeline() function (between the real getUserMedia call
+    // and the generator being assigned), we wait for setup to finish then
+    // return the generator track.
+    if (pipelineReady) {
+      console.log('[LT Injected] getUserMedia called during pipeline setup — awaiting ready');
+      await pipelineReady;
+      console.log('[LT Injected] Pipeline now ready — returning generator track');
+      return new MediaStream([generator.track]);
+    }
+
+    // ── First call: set up the pipeline ──────────────────────────────────────
+    // Assign pipelineReady immediately (before any await) so Guard 2 above
+    // can catch concurrent calls that arrive while we are still setting up.
+    let resolveReady;
+    pipelineReady = new Promise((res) => { resolveReady = res; });
+
     let realStream;
     try {
       realStream = await originalGetUserMedia(constraints);
       console.log('[LT Injected] Got real mic stream from browser');
     } catch (err) {
-      console.error('[LT Injected] Failed to get real mic stream:', err);
-      // Re-throw so Meet can handle permission-denied exactly as it normally would
+      console.error('[LT Injected] getUserMedia failed:', err);
+      pipelineReady = null; // reset so a retry can try again
       throw err;
     }
 
-    // Guard: if Meet calls getUserMedia multiple times (which it does for
-    // reconnects and codec negotiation), only set up the graph once.
-    if (realMicStream) {
-      console.log('[LT Injected] getUserMedia called again — returning existing fake stream');
-      return destinationNode.stream;
+    // ── Fallback: Insertable Streams not available ────────────────────────────
+    if (!INSERTABLE_STREAMS_SUPPORTED) {
+      console.warn('[LT Injected] Using real stream (no Insertable Streams) — audio unchanged');
+      window.postMessage({ source: 'lt-injected', type: 'micReady' }, '*');
+      resolveReady();
+      return realStream;
     }
 
-    realMicStream = realStream;
+    const originalTrack = realStream.getAudioTracks()[0];
+    console.log('[LT Injected] Real mic track:', originalTrack.label,
+      '| settings:', JSON.stringify(originalTrack.getSettings()));
 
-    // ── Step 2: Build the Web Audio processing graph ───────────────────────
-    // AudioContext must be created in the main world so it shares the same
-    // audio rendering engine as Meet itself.
-    audioContext    = new AudioContext();
-    const sourceNode = audioContext.createMediaStreamSource(realStream);
-    destinationNode  = audioContext.createMediaStreamDestination();
+    // Clone the track before giving it to MediaStreamTrackProcessor.
+    //
+    // On Windows, MediaStreamTrackProcessor holds an exclusive OS-level lock
+    // on whichever track it receives. If we passed originalTrack directly,
+    // Meet's Audio Worklet would try to open the same physical mic device in
+    // its own thread and get blocked — producing "Microphone can't be accessed".
+    //
+    // By cloning:
+    //   clonedTrack  → processor reads mic frames for our PCM pipeline
+    //   originalTrack stays with realStream → Meet/Audio Worklet can open
+    //                  the hardware normally (for echo cancellation etc.)
+    //   generator.track → what Meet's WebRTC actually sends to participants
+    clonedTrack = originalTrack.clone();
+    console.log('[LT Injected] Mic track cloned — processor uses clone, Meet uses generator.track');
 
-    // Pass-through by default: real mic → fake mic.
-    // When processing is enabled we keep this connection so audio still flows
-    // while playback nodes are connected on top for the processed chunks.
-    sourceNode.connect(destinationNode);
+    // Create processor and generator
+    processor = new MediaStreamTrackProcessor({ track: clonedTrack });
+    generator = new MediaStreamTrackGenerator({ kind: 'audio' });
+    console.log('[LT Injected] MediaStreamTrackProcessor and Generator created');
 
-    console.log('[LT Injected] Web Audio graph built — source → destination pass-through active');
-    console.log('[LT Injected] Fake mic stream id:', destinationNode.stream.id);
+    // Start the manual reader loop — only ever called ONCE.
+    // Guard against accidental re-entry with pipelineStarted.
+    if (!pipelineStarted) {
+      pipelineStarted = true;
+      runPipeline().catch((err) => {
+        console.error('[LT Injected] Pipeline loop terminated unexpectedly:', err);
+      });
+    }
 
-    // ── Step 3: Notify content.js that the mic is ready ───────────────────
-    window.postMessage(
-      { source: 'lt-injected', type: 'micReady' },
-      '*'
-    );
+    // Signal that setup is complete — any concurrent getUserMedia callers
+    // waiting on pipelineReady can now proceed.
+    resolveReady();
 
-    console.log('[LT Injected] Returning fake mic stream to Meet');
+    // Notify content.js — WebSocket opens after this
+    window.postMessage({ source: 'lt-injected', type: 'micReady' }, '*');
 
-    // ── Step 4: Return the fake stream to Meet ─────────────────────────────
-    return destinationNode.stream;
+    console.log('[LT Injected] Returning MediaStream backed by generator.track to Meet');
+    return new MediaStream([generator.track]);
   };
 
-  console.log('[LT Injected] getUserMedia override installed in main world ✓');
+  console.log('[LT Injected] getUserMedia override installed ✓');
 
-  // ─── MediaRecorder (runs in main world — has direct access to the stream) ──
-
-  function startRecording() {
-    if (!realMicStream) {
-      console.warn('[LT Injected] startRecording called but realMicStream is null');
-      window.postMessage({ source: 'lt-injected', type: 'recordingError', reason: 'no-stream' }, '*');
-      return;
-    }
-    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-      console.log('[LT Injected] MediaRecorder already running — ignoring startRecording');
-      return;
-    }
-
-    console.log(`[LT Injected] Creating MediaRecorder — mimeType=${MIME_TYPE}`);
-
-    try {
-      mediaRecorder = new MediaRecorder(realMicStream, { mimeType: MIME_TYPE });
-    } catch (err) {
-      console.warn('[LT Injected] Requested mimeType failed, falling back to browser default:', err.message);
-      mediaRecorder = new MediaRecorder(realMicStream);
-    }
-
-    mediaRecorder.ondataavailable = async (event) => {
-      if (!processingEnabled) return;
-      if (!event.data || event.data.size === 0) return;
-
-      // Convert Blob → base64 and send to content.js for WebSocket forwarding.
-      // Include the mimeType so the server knows how to decode the bytes.
-      try {
-        const arrayBuffer = await event.data.arrayBuffer();
-        const uint8 = new Uint8Array(arrayBuffer);
-        // btoa() requires a binary string — convert byte-by-byte
-        const base64 = btoa(String.fromCharCode(...uint8));
-        window.postMessage(
-          {
-            source:   'lt-injected',
-            type:     'audioChunk',
-            data:     base64,
-            size:     event.data.size,
-            mimeType: mediaRecorder.mimeType || MIME_TYPE,  // actual mimeType used
-          },
-          '*'
-        );
-      } catch (err) {
-        console.error('[LT Injected] Failed to encode audio chunk:', err);
-      }
-    };
-
-    mediaRecorder.onerror = (err) => {
-      console.error('[LT Injected] MediaRecorder error:', err);
-    };
-
-    mediaRecorder.onstop = () => {
-      console.log('[LT Injected] MediaRecorder stopped');
-      window.postMessage({ source: 'lt-injected', type: 'recordingStopped' }, '*');
-    };
-
-    mediaRecorder.start(250); // fire ondataavailable every 250ms
-    console.log('[LT Injected] MediaRecorder started — 250ms timeslice');
-    window.postMessage({ source: 'lt-injected', type: 'recordingStarted' }, '*');
-  }
-
-  function stopRecording() {
-    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-      mediaRecorder.stop();
-      console.log('[LT Injected] MediaRecorder stop() called');
-    } else {
-      console.log('[LT Injected] stopRecording: MediaRecorder was already inactive');
-    }
-  }
-
-  // ─── Play Processed Chunk ──────────────────────────────────────────────────
+  // ─── Manual Pipeline Loop ───────────────────────────────────────────────────
 
   /**
-   * Decodes a base64-encoded WebM/Opus chunk and plays it through the
-   * MediaStreamDestinationNode so Meet hears the processed voice.
+   * The heart of the Insertable Streams pipeline.
    *
-   * @param {string} base64   — the processed audio, base64 encoded
-   * @param {number} chunkId  — for logging only
+   * Reads AudioData frames one at a time from the processor's ReadableStream
+   * and writes either the mic frame or a processed frame from the server into
+   * the generator's WritableStream. This gives us complete, exclusive control
+   * over what Meet hears — one writer, one loop, clear logic.
+   *
+   * We obtain the writer here (not earlier) because you must call getWriter()
+   * before piping or the WritableStream is locked.
    */
-  async function playProcessedChunk(base64, chunkId) {
-    if (!audioContext || !destinationNode) {
-      console.warn(`[LT Injected] Chunk ${chunkId}: AudioContext not ready — cannot play`);
-      return;
-    }
+  async function runPipeline() {
+    const reader = processor.readable.getReader();
+    writer = generator.writable.getWriter();
+    console.log('[LT Injected] Pipeline loop started — reading mic frames');
 
-    let arrayBuffer;
     try {
-      const binaryString = atob(base64);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
+      while (true) {
+        const { done, value: audioData } = await reader.read();
+        if (done) {
+          console.log('[LT Injected] Processor ReadableStream ended — pipeline stopping');
+          break;
+        }
+
+        // All logic for each frame lives here
+        await handleAudioFrame(audioData);
       }
-      arrayBuffer = bytes.buffer;
     } catch (err) {
-      console.error(`[LT Injected] Chunk ${chunkId}: base64 decode failed:`, err);
-      return;
-    }
-
-    let audioBuffer;
-    try {
-      audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-    } catch (err) {
-      console.error(`[LT Injected] Chunk ${chunkId}: decodeAudioData failed:`, err);
-      return;
-    }
-
-    try {
-      const source = audioContext.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(destinationNode);
-      source.start();
-      console.log(
-        `[LT Injected] Playing processed audio back through fake mic — ` +
-        `${(audioBuffer.duration * 1000).toFixed(0)}ms audio | chunk #${chunkId}`
-      );
-    } catch (err) {
-      console.error(`[LT Injected] Chunk ${chunkId}: playback failed:`, err);
+      console.error('[LT Injected] Pipeline loop error:', err);
+    } finally {
+      try { reader.releaseLock(); } catch (_) {}
+      try { writer.releaseLock(); } catch (_) {}
+      // Stop the cloned track to release the OS microphone handle.
+      // The original track (owned by realStream) remains alive for Meet.
+      try {
+        if (clonedTrack) {
+          clonedTrack.stop();
+          console.log('[LT Injected] Cloned mic track stopped — OS handle released');
+        }
+      } catch (_) {}
+      console.log('[LT Injected] Pipeline loop exited — writer released');
     }
   }
 
-  // ─── postMessage Listener (commands from content.js) ──────────────────────
+  // ─── Per-Frame Logic ─────────────────────────────────────────────────────────
+
+  /**
+   * Called once per AudioData frame (~2.7ms at 48kHz / 128 samples per frame).
+   * Decides what to write to the generator:
+   *   - Processing OFF: mic frame unchanged
+   *   - Processing ON + processed audio ready: swap in a processed frame
+   *   - Processing ON + waiting for server: mic frame (never silence)
+   *
+   * AudioData memory contract:
+   *   If you write a frame, the stream owns it and closes it automatically.
+   *   If you discard a frame (e.g. replaced by a processed one), you MUST
+   *   call audioData.close() yourself, or memory leaks.
+   *
+   * @param {AudioData} audioData — the current mic frame from the processor
+   */
+  async function handleAudioFrame(audioData) {
+    // Always track the latest timestamp for building processed AudioData frames
+    currentTimestamp = audioData.timestamp;
+
+    // ── OFF: simple pass-through ─────────────────────────────────────────────
+    if (!processingEnabled) {
+      await writer.write(audioData);
+      return;
+    }
+
+    // ── ON: accumulate samples to send to server ─────────────────────────────
+    const buffer = new Float32Array(audioData.numberOfFrames);
+    audioData.copyTo(buffer, { planeIndex: 0 });
+
+    accumBuffer.push(buffer);
+    accumCount += audioData.numberOfFrames;
+
+    if (accumCount >= CHUNK_SAMPLES) {
+      // We have 250ms of audio — concatenate and send to server
+      const combined = new Float32Array(accumCount);
+      let offset = 0;
+      for (const buf of accumBuffer) {
+        combined.set(buf, offset);
+        offset += buf.length;
+      }
+      accumBuffer = [];
+      accumCount  = 0;
+
+      const id = ++chunkCounter;
+      console.log('[LT Injected] Sending PCM chunk', id, '→', combined.length, 'samples',
+        '@ sampleRate=', audioData.sampleRate, 'channels=', audioData.numberOfChannels);
+
+      window.postMessage({
+        source:           'lt-injected',
+        type:             'audioChunk',
+        chunkId:          id,
+        samples:          Array.from(combined),
+        sampleRate:       audioData.sampleRate,
+        numberOfChannels: audioData.numberOfChannels,
+        timestamp:        audioData.timestamp,
+      }, '*');
+    }
+
+    // ── Decide what to write to the generator ───────────────────────────────
+    if (playingProcessed && processedQueue.length > 0) {
+      // Swap: use a processed frame from the server, discard the mic frame
+      const processedFrame = processedQueue.shift();
+
+      if (processedQueue.length === 0) {
+        playingProcessed = false;
+        console.log('[LT Injected] Processed chunk exhausted — back to mic pass-through');
+      }
+
+      audioData.close(); // MUST close the discarded mic frame — prevents memory leak
+      await writer.write(processedFrame);
+    } else {
+      // Pass-through while waiting for server audio (never silence)
+      await writer.write(audioData);
+    }
+  }
+
+  // ─── Play Processed Audio ────────────────────────────────────────────────────
+
+  /**
+   * Called when content.js delivers processed PCM samples back from the server.
+   * Splits the flat Float32Array into 128-sample AudioData frames (matching
+   * the pipeline's native frame size) and pushes them into processedQueue.
+   * The main pipeline loop drains the queue frame-by-frame.
+   *
+   * @param {number[]} samples    — Float32Array values received from server
+   * @param {number}   sampleRate — e.g. 48000
+   * @param {number}   chunkId    — for logging
+   */
+  function playProcessedAudio(samples, sampleRate, chunkId) {
+    console.log('[LT Injected] Received processed PCM chunk', chunkId,
+      '—', samples.length, 'samples @ sampleRate=', sampleRate);
+
+    const FRAME_SIZE = 128; // match the mic's native frame size
+    const frames = [];
+    let ts = currentTimestamp; // pick up from where the mic currently is
+
+    for (let i = 0; i < samples.length; i += FRAME_SIZE) {
+      const end       = Math.min(i + FRAME_SIZE, samples.length);
+      const frameData = new Float32Array(samples.slice(i, end));
+
+      try {
+        const frame = new AudioData({
+          format:           'f32-planar',
+          sampleRate:       sampleRate,
+          numberOfFrames:   frameData.length,
+          numberOfChannels: 1,
+          timestamp:        ts,
+          data:             frameData,
+        });
+        frames.push(frame);
+        // Advance timestamp by the duration of this frame in microseconds
+        ts += Math.round((frameData.length / sampleRate) * 1_000_000);
+      } catch (err) {
+        console.error('[LT Injected] Failed to create AudioData frame at offset', i, ':', err);
+      }
+    }
+
+    if (frames.length > 0) {
+      processedQueue.push(...frames);
+      playingProcessed = true;
+      console.log('[LT Injected] Queued', frames.length, 'AudioData frames for playback from chunk', chunkId);
+    } else {
+      console.warn('[LT Injected] No frames created for chunk', chunkId, '— nothing to play');
+    }
+  }
+
+  // ─── postMessage Listener (commands from content.js) ────────────────────────
 
   window.addEventListener('message', (event) => {
-    // Only handle messages from our content script
     if (!event.data || event.data.source !== 'lt-content') return;
-
     const msg = event.data;
-    console.log('[LT Injected] Received command from content.js:', msg.type);
+    console.log('[LT Injected] Command from content.js:', msg.type);
 
     switch (msg.type) {
       case 'startRecording':
+        // Reset all accumulation and playback state for a clean start
+        accumBuffer      = [];
+        accumCount       = 0;
+        processedQueue   = [];
+        playingProcessed = false;
         processingEnabled = true;
-        startRecording();
+        console.log('[LT Injected] Processing ENABLED — accumulating PCM, sending to server');
         break;
 
       case 'stopRecording':
         processingEnabled = false;
-        stopRecording();
+        // Clear everything — mic pass-through takes over immediately
+        accumBuffer      = [];
+        accumCount       = 0;
+        processedQueue   = [];
+        playingProcessed = false;
+        console.log('[LT Injected] Processing DISABLED — mic pass-through restored');
         break;
 
       case 'setPitch':
-        currentPitch = msg.pitch;
-        console.log(`[LT Injected] Pitch set to ${currentPitch} semitones`);
+        // Pitch UI removed from popup — this message is no longer sent.
+        // Handler kept as a no-op so old messages don't fall through to
+        // the default warning.
+        currentPitch = msg.pitch || 0;
         break;
 
       case 'playChunk':
-        // content.js received processed audio from server and is asking us to
-        // play it through the fake mic (only main world has access to AudioContext)
-        playProcessedChunk(msg.data, msg.chunkId).catch((err) => {
-          console.error('[LT Injected] playChunk error:', err);
-        });
+        // content.js is delivering processed PCM samples from the server
+        if (processingEnabled) {
+          playProcessedAudio(msg.samples, msg.sampleRate, msg.chunkId);
+        } else {
+          console.log('[LT Injected] playChunk ignored — processing is disabled');
+        }
         break;
 
       default:

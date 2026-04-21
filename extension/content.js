@@ -6,10 +6,11 @@
  * in a way that affects Google Meet. Instead, its first job is to inject
  * injected.js into the page's MAIN WORLD (where Meet lives).
  *
- * Architecture after the isolated-world fix:
+ * Architecture — Insertable Streams edition:
  *
- *   injected.js  (main world)       — owns getUserMedia override, AudioContext,
- *                                     MediaRecorder, audio playback
+ *   injected.js  (main world)       — owns getUserMedia override,
+ *                                     MediaStreamTrackProcessor/Generator pipeline,
+ *                                     PCM accumulation, processed audio playback
  *        ↕  window.postMessage
  *   content.js   (isolated world)   — owns WebSocket, Chrome API calls,
  *                                     latency maths, message routing
@@ -17,6 +18,17 @@
  *   background.js (service worker)  — store stats, forward popup ↔ content
  *        ↕  chrome.tabs.sendMessage
  *   popup.js                        — displays status, toggle, pitch, latency
+ *
+ * Message types injected.js → content.js (via postMessage, source: 'lt-injected'):
+ *   micReady      — Insertable Streams pipeline is ready, open WebSocket
+ *   audioChunk    — 250ms raw PCM chunk ready to send to server
+ *                   { chunkId, samples, sampleRate, numberOfChannels, timestamp }
+ *
+ * Message types content.js → injected.js (via postMessage, source: 'lt-content'):
+ *   startRecording — enable processing
+ *   stopRecording  — disable processing
+ *   setPitch       — { pitch: N semitones }
+ *   playChunk      — { chunkId, samples, sampleRate }  processed PCM from server
  *
  * All console.log calls are prefixed with [LT Content] for easy filtering.
  * Logs from injected.js are prefixed with [LT Injected].
@@ -60,19 +72,18 @@ console.log('[LT Content] Isolated-world script starting');
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-let ws               = null;   // WebSocket connection to the local server
-let chunkId          = 0;      // Monotonically increasing chunk counter
-let currentPitch     = 0;      // Current pitch in semitones (kept in sync with injected.js)
-let processingEnabled = false; // Whether audio processing is active
+let ws                = null;   // WebSocket connection to the local server
+let currentPitch      = 0;      // Current pitch in semitones (kept in sync with injected.js)
+let processingEnabled = false;  // Whether audio processing is active
 
-// Chunks that arrive before the WebSocket is open are queued here
-let pendingChunks = [];
+// Chunks that arrive before the WebSocket is open are dropped.
+// Raw PCM is time-sensitive — stale audio from before the socket opened
+// is useless. (Small chunks at 250ms: at most 1 chunk in flight.)
 
 // ─── WebSocket Connection ─────────────────────────────────────────────────────
 
 /**
  * Opens a WebSocket to ws://localhost:8080 and handles the lifecycle.
- * Queued chunks are flushed on connect.
  * Auto-reconnects after 3 seconds on close.
  */
 function connectWebSocket() {
@@ -82,15 +93,9 @@ function connectWebSocket() {
   ws.onopen = () => {
     console.log('[LT Content] WebSocket connected ✓');
     chrome.runtime.sendMessage({ type: 'connectionStatus', connected: true });
-
-    if (pendingChunks.length > 0) {
-      console.log(`[LT Content] Flushing ${pendingChunks.length} queued chunk(s)`);
-      pendingChunks.forEach((msg) => ws.send(JSON.stringify(msg)));
-      pendingChunks = [];
-    }
   };
 
-  ws.onmessage = async (event) => {
+  ws.onmessage = (event) => {
     const t4 = Date.now(); // moment the processed chunk arrives back
 
     let message;
@@ -101,8 +106,14 @@ function connectWebSocket() {
       return;
     }
 
+    // ── Legacy webm/opus audio echo (kept for backward compat) ───────────────
     if (message.type === 'audio') {
-      await handleProcessedAudio(message, t4);
+      handleProcessedAudioLegacy(message, t4);
+    }
+
+    // ── New PCM round-trip ────────────────────────────────────────────────────
+    if (message.type === 'audioPCM') {
+      handleProcessedPCM(message, t4);
     }
   };
 
@@ -119,75 +130,110 @@ function connectWebSocket() {
   };
 }
 
-// ─── Handle Audio Chunks from injected.js ─────────────────────────────────────
+// ─── Send Raw PCM Chunk to Server ─────────────────────────────────────────────
 
 /**
- * Called every 250ms when injected.js has encoded a mic audio chunk.
- * Wraps it in a JSON message with timing, pitch, and format metadata and sends
- * it over WebSocket (or queues it if the socket isn't open yet).
+ * Called when injected.js has accumulated 250ms of raw PCM samples (12000
+ * samples at 48kHz) and wants them sent to the server for processing.
  *
- * @param {string} base64    — audio data, base64 encoded
- * @param {number} size      — original Blob size in bytes, for logging
- * @param {string} mimeType  — the mimeType used by MediaRecorder (e.g. 'audio/wav')
+ * We send the Float32Array values as a plain JSON array. This is acceptable
+ * on localhost — when we deploy remotely we will add AudioEncoder (WebCodecs)
+ * to compress to opus first and reduce bandwidth ~10×.
+ *
+ * @param {object} msg — the audioChunk postMessage from injected.js
+ *   { chunkId, samples: number[], sampleRate, numberOfChannels, timestamp }
  */
-function sendAudioChunk(base64, size, mimeType) {
-  const id = ++chunkId;
-  const t1 = Date.now();
+function sendPCMChunk(msg) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    console.log('[LT Content] PCM chunk', msg.chunkId, 'dropped — WebSocket not open');
+    return;
+  }
 
+  const t1 = Date.now();
   const message = {
-    type:     'audio',
-    chunkId:  id,
+    type:             'audioPCM',
+    chunkId:          msg.chunkId,
     t1,
-    pitch:    currentPitch,
-    mimeType: mimeType || 'audio/webm',
-    data:     base64,
+    pitch:            currentPitch,
+    sampleRate:       msg.sampleRate,
+    numberOfChannels: msg.numberOfChannels,
+    samples:          msg.samples,   // Float32Array values as JSON array
   };
 
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(message));
-    console.log(`[LT Content] Chunk ${id} sent (t1=${t1}, pitch=${currentPitch}, mime=${message.mimeType}, size=${size}B)`);
-  } else {
-    pendingChunks.push(message);
-    console.log(`[LT Content] Chunk ${id} queued — WebSocket not ready (queue=${pendingChunks.length})`);
-  }
+  ws.send(JSON.stringify(message));
+  console.log('[LT Content] PCM chunk', msg.chunkId, 'sent —',
+    msg.samples.length, 'samples @ sampleRate=', msg.sampleRate,
+    '| t1=', t1, '| pitch=', currentPitch);
 }
 
-// ─── Handle Processed Audio from Server ───────────────────────────────────────
+// ─── Handle Processed PCM from Server ─────────────────────────────────────────
 
 /**
- * Called when the server returns a pitch-shifted audio chunk.
- * Calculates latency, reports stats to background.js, and forwards the
- * base64 audio to injected.js for playback through the fake mic.
+ * Called when the server returns a processed PCM chunk (type: 'audioPCM').
+ * Calculates latency, reports to background.js, and forwards the samples
+ * to injected.js for playback via the Insertable Streams generator.
  *
  * @param {object} message — parsed JSON from the server
- * @param {number} t4      — timestamp when this message was received
+ *   { type, chunkId, t1, t2, t3, samples, sampleRate, numberOfChannels }
+ * @param {number} t4 — timestamp when this message was received
  */
-async function handleProcessedAudio(message, t4) {
-  const { chunkId: id, t1, t2, t3, data, processingFailed } = message;
+function handleProcessedPCM(message, t4) {
+  const { chunkId, t1, t2, t3, samples, sampleRate, numberOfChannels } = message;
 
   const networkIn  = t2 - t1; // extension → server
-  const processing = t3 - t2; // server processAudioChunk()
+  const processing = t3 - t2; // server processPCM()
   const networkOut = t4 - t3; // server → extension
   const total      = t4 - t1; // full round-trip
 
   console.log(
-    `[LT Content] Chunk ${id} returned | net-in=${networkIn}ms | proc=${processing}ms | net-out=${networkOut}ms | total=${total}ms` +
-    (processingFailed ? ' ⚠ PROCESSING FAILED — original audio' : '')
+    `[LT Content] PCM chunk ${chunkId} returned | net-in=${networkIn}ms | proc=${processing}ms | net-out=${networkOut}ms | total=${total}ms`
   );
 
-  // Report latency to background.js so popup can display it
+  // Report latency stats to background.js so popup can display them
   chrome.runtime.sendMessage({
-    type: 'latencyUpdate',
-    stats: { chunkId: id, networkIn, processing, networkOut, total, processingFailed: !!processingFailed },
+    type:  'latencyUpdate',
+    stats: { chunkId, networkIn, processing, networkOut, total, processingFailed: false },
   });
 
-  // Forward processed audio to injected.js for playback in the main world.
-  // injected.js has the AudioContext and destinationNode — only it can play
-  // audio into the fake mic stream.
-  window.postMessage(
-    { source: 'lt-content', type: 'playChunk', chunkId: id, data },
-    '*'
+  // Forward processed samples to injected.js (main world) for playback.
+  // injected.js owns the MediaStreamTrackGenerator — only it can write frames.
+  window.postMessage({
+    source:   'lt-content',
+    type:     'playChunk',
+    chunkId,
+    samples,
+    sampleRate,
+  }, '*');
+}
+
+// ─── Handle Legacy webm/opus Echo (backward compatibility) ────────────────────
+
+/**
+ * Handles the old 'audio' message type from the server (webm/opus base64).
+ * Kept so the old server echo path still reports latency, but injected.js
+ * no longer plays webm/opus — it only plays PCM. This handler logs the
+ * old path and reports latency but does not forward audio to injected.js.
+ *
+ * @param {object} message — { chunkId, t1, t2, t3, data, processingFailed }
+ * @param {number} t4
+ */
+function handleProcessedAudioLegacy(message, t4) {
+  const { chunkId: id, t1, t2, t3, processingFailed } = message;
+  const networkIn  = t2 - t1;
+  const processing = t3 - t2;
+  const networkOut = t4 - t3;
+  const total      = t4 - t1;
+
+  console.log(
+    `[LT Content] Legacy audio chunk ${id} returned | net-in=${networkIn}ms | proc=${processing}ms | net-out=${networkOut}ms | total=${total}ms` +
+    (processingFailed ? ' ⚠ PROCESSING FAILED' : '') +
+    ' (legacy webm/opus path — not forwarded to injected.js)'
   );
+
+  chrome.runtime.sendMessage({
+    type:  'latencyUpdate',
+    stats: { chunkId: id, networkIn, processing, networkOut, total, processingFailed: !!processingFailed },
+  });
 }
 
 // ─── postMessage Listener (messages from injected.js) ────────────────────────
@@ -199,30 +245,18 @@ window.addEventListener('message', (event) => {
 
   switch (msg.type) {
     case 'micReady':
-      // injected.js has intercepted getUserMedia and built the audio graph.
-      // Now we open the WebSocket — from this point on we can start recording.
-      console.log('[LT Content] micReady received — getUserMedia was intercepted ✓');
+      // injected.js has set up the Insertable Streams pipeline.
+      // Open the WebSocket now — we can start receiving PCM chunks.
+      console.log('[LT Content] micReady received — Insertable Streams pipeline active ✓');
       console.log('[LT Content] Opening WebSocket connection to server');
       connectWebSocket();
       break;
 
     case 'audioChunk':
-      // injected.js encoded a 250ms mic chunk and sent it here for WebSocket forwarding
+      // injected.js accumulated 250ms of raw PCM samples — send to server
       if (processingEnabled) {
-        sendAudioChunk(msg.data, msg.size, msg.mimeType);
+        sendPCMChunk(msg);
       }
-      break;
-
-    case 'recordingStarted':
-      console.log('[LT Content] MediaRecorder confirmed started in main world');
-      break;
-
-    case 'recordingStopped':
-      console.log('[LT Content] MediaRecorder confirmed stopped in main world');
-      break;
-
-    case 'recordingError':
-      console.error('[LT Content] Recording error from injected.js:', msg.reason);
       break;
 
     default:
@@ -250,16 +284,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     sendResponse({ ok: true });
   }
 
-  if (message.type === 'setPitch') {
-    currentPitch = message.pitch;
-    // Forward pitch change to injected.js so the MediaRecorder tag knows the value
-    window.postMessage({ source: 'lt-content', type: 'setPitch', pitch: currentPitch }, '*');
-    console.log(`[LT Content] Pitch forwarded to injected.js: ${currentPitch} semitones`);
+  if (message.type === 'ping') {
     sendResponse({ ok: true });
   }
 
-  if (message.type === 'ping') {
-    sendResponse({ ok: true });
+  if (message.type === 'getConnectionStatus') {
+    // Popup (via background.js) is asking for the live WebSocket state.
+    // Respond immediately with the current readyState — no async needed.
+    const connected = ws && ws.readyState === WebSocket.OPEN;
+    console.log('[LT Content] getConnectionStatus → connected:', connected);
+    sendResponse({ connected });
+    return true;
   }
 
   return true; // keep async sendResponse channel open

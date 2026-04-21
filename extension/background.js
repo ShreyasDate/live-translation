@@ -87,7 +87,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // ── Messages FROM popup.js ─────────────────────────────────────────────────
 
   if (message.type === 'getStats') {
-    // Popup is polling for the latest stats — respond immediately
+    // Also ask the content script for the LIVE WebSocket state.
+    // This eliminates the race where the popup opens before background.js
+    // received a connectionStatus update, showing a stale "Not connected".
+    getMeetTab().then(tab => {
+      if (tab) {
+        chrome.tabs.sendMessage(tab.id, { type: 'getConnectionStatus' }, (response) => {
+          if (response && typeof response.connected === 'boolean') {
+            isConnected = response.connected;
+            console.log('[LT Background] Live connection status from content.js:', isConnected);
+          }
+        });
+      }
+    });
+    // Respond immediately with the current cached values; the live poll above
+    // updates isConnected for the NEXT getStats call (2-second interval).
     console.log('[LT Background] Popup requested stats — responding with:', { latestStats, isConnected });
     sendResponse({ stats: latestStats, connected: isConnected });
     return true;
@@ -97,14 +111,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Forward the toggle to the Meet content script
     console.log(`[LT Background] Forwarding toggle (enabled=${message.enabled}) to Meet tab`);
     sendToMeetTab({ type: 'toggle', enabled: message.enabled });
-    sendResponse({ ok: true });
-    return true;
-  }
-
-  if (message.type === 'setPitch') {
-    // Forward the pitch change to the Meet content script
-    console.log(`[LT Background] Forwarding setPitch (pitch=${message.pitch}) to Meet tab`);
-    sendToMeetTab({ type: 'setPitch', pitch: message.pitch });
     sendResponse({ ok: true });
     return true;
   }

@@ -18,8 +18,6 @@ console.log('[LT Popup] Popup opened');
 const statusDot      = document.getElementById('status-dot');
 const statusText     = document.getElementById('status-text');
 const toggleCheckbox = document.getElementById('toggle-checkbox');
-const pitchSlider    = document.getElementById('pitch-slider');
-const pitchDisplay   = document.getElementById('pitch-display');
 
 const latNetworkIn  = document.getElementById('lat-network-in');
 const latProcessing = document.getElementById('lat-processing');
@@ -73,15 +71,6 @@ function setConnected(connected) {
   }
 }
 
-/**
- * Formats the pitch slider value for display.
- * e.g. 0 → "0 semitones", 2 → "+2 semitones", -3 → "-3 semitones"
- */
-function formatPitch(value) {
-  const n = parseInt(value, 10);
-  const sign = n > 0 ? '+' : '';
-  return `${sign}${n} semitones`;
-}
 
 // ─── Fetch & Render Stats ─────────────────────────────────────────────────────
 
@@ -127,17 +116,6 @@ toggleCheckbox.addEventListener('change', async () => {
   }
 });
 
-// Pitch slider — update display and send new value to background
-pitchSlider.addEventListener('input', async () => {
-  const pitch = parseInt(pitchSlider.value, 10);
-  pitchDisplay.textContent = formatPitch(pitch);
-  console.log(`[LT Popup] Pitch slider → ${pitch} semitones`);
-  try {
-    await chrome.runtime.sendMessage({ type: 'setPitch', pitch });
-  } catch (err) {
-    console.error('[LT Popup] Failed to send setPitch:', err.message);
-  }
-});
 
 // ─── Initialise ───────────────────────────────────────────────────────────────
 
@@ -153,7 +131,5 @@ window.addEventListener('unload', () => {
   console.log('[LT Popup] Popup closed — polling stopped');
 });
 
-// Set initial pitch display
-pitchDisplay.textContent = formatPitch(pitchSlider.value);
 
 console.log('[LT Popup] Initialised successfully');

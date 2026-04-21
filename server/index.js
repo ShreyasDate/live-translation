@@ -1,11 +1,25 @@
 /**
  * server/index.js — Live Translation WebSocket Server
  *
- * Audio format: audio/webm;codecs=opus throughout the entire pipeline.
+ * Supports two audio pipeline modes:
  *
- * processAudioChunk is currently a simple ECHO — it returns audio unchanged.
- * This proves the full round-trip pipeline works with zero processing overhead.
- * Replace only the body of processAudioChunk when integrating Deepgram + Gemini.
+ *   ┌─ NEW (default) ────────────────────────────────────────────────────────┐
+ *   │ type: 'audioPCM'                                                        │
+ *   │ Extension sends raw Float32Array PCM (12000 samples / 250ms, 48kHz)    │
+ *   │ Server calls processPCM() → returns Float32Array of processed samples   │
+ *   │ Server sends back 'audioPCM' with processed samples array               │
+ *   └────────────────────────────────────────────────────────────────────────┘
+ *
+ *   ┌─ LEGACY (kept for backward compat) ────────────────────────────────────┐
+ *   │ type: 'audio'                                                            │
+ *   │ Extension sends base64-encoded webm/opus                                 │
+ *   │ Server calls processAudioChunk() → echo                                  │
+ *   │ Server sends back 'audio' with base64 audio                              │
+ *   └────────────────────────────────────────────────────────────────────────┘
+ *
+ * processPCM is the SINGLE SWAPPABLE FUNCTION — replace its body with
+ * Deepgram STT + Gemini Flash + Deepgram Aura TTS when ready.
+ * Nothing else in this file needs to change.
  *
  * Backpressure: each client has a queue capped at MAX_QUEUE_DEPTH chunks.
  * If the queue is full when a new chunk arrives, the oldest chunks are dropped.
@@ -26,7 +40,7 @@ const Fastify = require('fastify');
 // ─── Feature Flag ─────────────────────────────────────────────────────────────
 
 /**
- * When false, processAudioChunk is bypassed and the function logs that fact.
+ * When false, processPCM and processAudioChunk are bypassed (raw echo).
  * Useful for measuring raw WebSocket round-trip latency with zero processing.
  *
  *   ENABLE_PROCESSING=false node index.js
@@ -84,43 +98,80 @@ function broadcastToDashboard(payload) {
   }
 }
 
-// ─── Main Processing Function ──────────────────────────────────────────────────
+// ─── PCM Processing Function ───────────────────────────────────────────────────
 
 /**
- * processAudioChunk — THE SINGLE SWAPPABLE PROCESSING UNIT
+ * processPCM — THE SINGLE SWAPPABLE PROCESSING FUNCTION
  *
  * =====================================================================
- * CURRENT STATE: ECHO PLACEHOLDER
- * Returns the input buffer unchanged. Proves the full round-trip pipeline
- * works: capture → WebSocket → server → WebSocket → playback → fake mic.
+ * CURRENT STATE: DEMO PLACEHOLDER — tanh soft-clip saturation
+ *
+ * Applies a tanh soft-clipper with a 2× input gain. This makes the voice
+ * noticeably louder and slightly distorted — clearly audible proof that
+ * the server is processing the audio in real time.
  *
  * IN PRODUCTION THIS WILL BE REPLACED WITH:
  *   1. Deepgram Streaming STT  → transcript text
  *   2. Gemini Flash            → translated text
- *   3. Deepgram Aura TTS       → audio buffer
+ *   3. Deepgram Aura TTS       → Float32Array of audio samples
  *
  * The function signature is PERMANENT:
- *   input:  Buffer of webm/opus audio
- *   output: Promise<Buffer> of webm/opus audio
+ *   input:  Float32Array of raw PCM samples (f32-planar, 48kHz, mono)
+ *   output: Float32Array of processed PCM samples (same format/rate)
  *
  * The WebSocket handler and backpressure logic never change.
  * Only the body of this function changes when we integrate Deepgram.
  *
- * To bypass entirely: ENABLE_PROCESSING=false node index.js
+ * To bypass (pure echo): ENABLE_PROCESSING=false node index.js
  * =====================================================================
  *
- * @param {Buffer} inputBuffer    — webm/opus audio from the extension
- * @param {string} mimeType       — MIME type reported by MediaRecorder (informational)
- * @param {number} pitchSemitones — pitch shift requested (ignored by echo, used by real impl)
- * @returns {Promise<Buffer>}     — processed audio (currently: original unchanged)
+ * @param {Float32Array} samples       — raw PCM from the extension
+ * @param {number}       pitchSemitones — pitch shift requested (for future use)
+ * @returns {Float32Array}             — processed samples
+ */
+function processPCM(samples, pitchSemitones) {
+  // ================================================================
+  // PLACEHOLDER — WILL BE REPLACED WITH:
+  // 1. Deepgram Streaming STT  → transcript text
+  // 2. Gemini Flash            → translated text
+  // 3. Deepgram Aura TTS       → audio samples (Float32Array)
+  //
+  // Input:  Float32Array of raw PCM samples (f32-planar, 48kHz, mono)
+  // Output: Float32Array of processed PCM samples (same format)
+  //
+  // To bypass: ENABLE_PROCESSING=false node index.js
+  // ================================================================
+
+  if (!ENABLE_PROCESSING) return samples;
+
+  // Demo effect: tanh soft-clip saturation
+  // Math.tanh(x * 2.0) compresses the dynamic range — loud samples are
+  // pushed toward ±1 rather than clipping hard. The 2× input gain ensures
+  // the effect is clearly audible compared to the original voice.
+  const output = new Float32Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    output[i] = Math.tanh(samples[i] * 2.0);
+  }
+  return output;
+}
+
+// ─── Legacy webm/opus Processing Function ─────────────────────────────────────
+
+/**
+ * processAudioChunk — legacy echo handler for type: 'audio' messages.
+ *
+ * Returns the input buffer unchanged. Kept for backward compatibility so old
+ * extension builds that send webm/opus still get a valid response and correct
+ * latency reporting.
+ *
+ * @param {Buffer} inputBuffer
+ * @param {string} mimeType
+ * @param {number} pitchSemitones
+ * @returns {Promise<Buffer>}
  */
 async function processAudioChunk(inputBuffer, mimeType, pitchSemitones) {
-  if (!ENABLE_PROCESSING) {
-    return inputBuffer;
-  }
-
-  // ECHO — return audio unchanged.
-  // This proves end-to-end connectivity without any processing risk.
+  // Echo — return audio unchanged regardless of ENABLE_PROCESSING.
+  // The old pipeline is no longer the demo path.
   return inputBuffer;
 }
 
@@ -154,15 +205,91 @@ async function drainQueue(socket) {
 }
 
 /**
- * Processes a single audio chunk message and sends the result back.
+ * Processes a single message — dispatches to the correct handler
+ * based on message.type ('audio' legacy or 'audioPCM' new path).
  */
 async function processOne(socket, message) {
+  if (message.type === 'audioPCM') {
+    await processOnePCM(socket, message);
+  } else if (message.type === 'audio') {
+    await processOneLegacy(socket, message);
+  }
+}
+
+// ─── PCM Message Handler ───────────────────────────────────────────────────────
+
+/**
+ * Processes a single 'audioPCM' message.
+ * Calls processPCM(), sends back 'audioPCM', broadcasts to dashboard.
+ */
+async function processOnePCM(socket, message) {
+  const { chunkId, t1, pitch = 0, sampleRate = 48000, numberOfChannels = 1, samples } = message;
+  const t2 = Date.now();
+
+  console.log(
+    `[Server] PCM chunk ${chunkId} received | net-in=${t2 - t1}ms | ` +
+    `samples=${samples.length} | sampleRate=${sampleRate} | pitch=${pitch >= 0 ? '+' : ''}${pitch}`
+  );
+
+  try {
+    const inputSamples  = new Float32Array(samples);
+    const outputSamples = processPCM(inputSamples, pitch);
+    const t3            = Date.now();
+
+    console.log(
+      `[Server] PCM chunk ${chunkId} complete | process=${t3 - t2}ms | ` +
+      `in=${inputSamples.length} samples | out=${outputSamples.length} samples`
+    );
+
+    sendJson(socket, {
+      type:             'audioPCM',
+      chunkId,
+      t1, t2, t3,
+      sampleRate,
+      numberOfChannels,
+      samples:          Array.from(outputSamples),
+    });
+
+    broadcastToDashboard({
+      type:       'chunkStats',
+      chunkId,
+      t1, t2, t3,
+      networkIn:  t2 - t1,
+      processing: t3 - t2,
+    });
+
+  } catch (err) {
+    console.error(`[Server] PCM chunk ${chunkId}: unexpected error:`, err.message);
+    const t3 = Date.now();
+    // On error, echo the original samples back so processing never goes silent
+    sendJson(socket, {
+      type: 'audioPCM',
+      chunkId, t1, t2, t3,
+      sampleRate, numberOfChannels,
+      samples,
+      processingFailed: true,
+    });
+    broadcastToDashboard({
+      type: 'chunkStats', chunkId, t1, t2, t3,
+      networkIn: t2 - t1, processing: t3 - t2, processingFailed: true,
+    });
+  }
+}
+
+// ─── Legacy webm/opus Message Handler ─────────────────────────────────────────
+
+/**
+ * Processes a single legacy 'audio' message (webm/opus base64).
+ * Kept for backward compatibility — echoes audio back unchanged.
+ */
+async function processOneLegacy(socket, message) {
   const { chunkId, t1, pitch = 0, mimeType = 'audio/webm', data } = message;
   const t2 = Date.now();
 
   const approxBytes = Math.round(data.length * 0.75);
   console.log(
-    `[Server] Chunk ${chunkId} received | net-in=${t2 - t1}ms | pitch=${pitch >= 0 ? '+' : ''}${pitch} | mime=${mimeType} | ~${approxBytes}B`
+    `[Server] Legacy chunk ${chunkId} received | net-in=${t2 - t1}ms | ` +
+    `pitch=${pitch >= 0 ? '+' : ''}${pitch} | mime=${mimeType} | ~${approxBytes}B`
   );
 
   try {
@@ -172,7 +299,7 @@ async function processOne(socket, message) {
     const outputBase64 = outputBuffer.toString('base64');
 
     console.log(
-      `[Server] Chunk ${chunkId} complete: net-in=${t2 - t1}ms | process=${t3 - t2}ms | echo`
+      `[Server] Legacy chunk ${chunkId} complete: net-in=${t2 - t1}ms | process=${t3 - t2}ms | echo`
     );
 
     sendJson(socket, { type: 'audio', chunkId, t1, t2, t3, data: outputBase64 });
@@ -186,7 +313,7 @@ async function processOne(socket, message) {
     });
 
   } catch (err) {
-    console.error(`[Server] Chunk ${chunkId}: unexpected error:`, err.message);
+    console.error(`[Server] Legacy chunk ${chunkId}: unexpected error:`, err.message);
     const t3 = Date.now();
     sendJson(socket, { type: 'audio', chunkId, t1, t2, t3, data, processingFailed: true });
     broadcastToDashboard({
@@ -235,8 +362,8 @@ fastify.register(async function (fastify) {
         return;
       }
 
-      // ── Audio chunk ──────────────────────────────────────────────────────────
-      if (message.type === 'audio') {
+      // ── PCM audio chunk (new path) ───────────────────────────────────────────
+      if (message.type === 'audioPCM' || message.type === 'audio') {
         const queue = clientQueues.get(socket);
 
         // ── Backpressure: drop oldest chunks if queue is full ─────────────────
@@ -280,7 +407,7 @@ fastify.register(async function (fastify) {
 fastify.get('/health', async () => ({
   status:           'ok',
   enableProcessing: ENABLE_PROCESSING,
-  audioFormat:      'audio/webm;codecs=opus',
+  audioFormat:      'PCM Float32Array (audioPCM) + legacy webm/opus (audio)',
   maxQueueDepth:    MAX_QUEUE_DEPTH,
   extensionClients: extensionClients.size,
   dashboardClients: dashboardClients.size,
@@ -294,11 +421,14 @@ const PORT = 8080;
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err, address) => {
   if (err) { console.error('[Server] Startup error:', err); process.exit(1); }
   console.log(`[Server] Live Translation server running at ${address}`);
-  console.log(`[Server] Audio format         : audio/webm;codecs=opus`);
-  console.log(`[Server] ENABLE_PROCESSING    : ${ENABLE_PROCESSING}`);
-  console.log(`[Server] Max queue depth      : ${MAX_QUEUE_DEPTH} chunks per client`);
-  console.log(`[Server] WebSocket extension  : ws://localhost:${PORT}`);
-  console.log(`[Server] WebSocket dashboard  : ws://localhost:${PORT}?client=dashboard`);
-  console.log(`[Server] Health check         : http://localhost:${PORT}/health`);
-  console.log(`[Server] Bypass mode          : ENABLE_PROCESSING=false node index.js`);
+  console.log(`[Server] Audio format (new)    : PCM Float32Array via type='audioPCM'`);
+  console.log(`[Server] Audio format (legacy) : webm/opus base64 via type='audio' (echo)`);
+  console.log(`[Server] ENABLE_PROCESSING     : ${ENABLE_PROCESSING}`);
+  console.log(`[Server] Max queue depth       : ${MAX_QUEUE_DEPTH} chunks per client`);
+  console.log(`[Server] WebSocket extension   : ws://localhost:${PORT}`);
+  console.log(`[Server] WebSocket dashboard   : ws://localhost:${PORT}?client=dashboard`);
+  console.log(`[Server] Health check          : http://localhost:${PORT}/health`);
+  console.log(`[Server] Bypass mode           : ENABLE_PROCESSING=false node index.js`);
+  console.log(`[Server] Demo effect           : tanh soft-clip saturation (2× gain)`);
+  console.log(`[Server] Replace processPCM()  : swap body for Deepgram+Gemini+TTS`);
 });

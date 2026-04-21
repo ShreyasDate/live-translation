@@ -1678,3 +1678,321 @@ async function processAudioChunk(inputBuffer, mimeType, pitchSemitones) {
 ```
 
 The function signature does not change. The WebSocket handler does not change. The backpressure queue does not change. The extension does not change. Only these ~10 lines change.
+
+---
+
+## 18. Why We Switched from decodeAudioData to MediaSource API
+
+### What decodeAudioData Is
+
+`AudioContext.decodeAudioData` is a Web Audio API method that takes a complete audio file as an `ArrayBuffer` and fully decodes it into an `AudioBuffer` — the Web Audio API's internal, uncompressed, floating-point representation of audio data. The key word is **complete**. `decodeAudioData` needs the entire file: the format header, all codec initialisation tables, and all encoded audio data. It cannot work with partial files or streaming data. It was designed for loading a sound clip once and playing it — background music, sound effects, UI sounds. Not for streaming.
+
+### Why decodeAudioData Failed on MediaRecorder Chunks
+
+`MediaRecorder` produces a **streaming WebM** file, not a series of independent complete files. The WebM container format has the following structure:
+
+- **Chunk 1 (the first chunk, ~1–2 KB)**: Contains the EBML header (the WebM container magic number and structure), the Segment header, and the `Tracks` element (codec name: `opus`, sample rate: 48000 Hz, channel count: 1). This first chunk is a valid, complete WebM file that `decodeAudioData` can decode successfully.
+
+- **Chunk 2, 3, 4, … (all subsequent chunks, ~4–6 KB each)**: Contain only `Cluster` elements — raw Opus audio data blocks. There is no header. There is no codec information. There is no EBML magic number. These chunks are **continuation data** — they are only meaningful when appended to the stream after the first chunk.
+
+When we called `decodeAudioData` on chunk 5, for example, the browser received a buffer that started with a raw audio block, not an EBML header. The decoder immediately failed with an `EncodingError DOMException` — it looked at the first bytes, found nothing it recognised as a valid audio file format, and gave up. The error `"Unable to decode audio data"` in DevTools was not a network error or a server error — it was the browser correctly reporting that the bytes it received were not a valid standalone audio file, because they were not.
+
+This is why the pipeline appeared to work (chunk 1 played), but all subsequent chunks failed silently in the `catch` block, producing no audio.
+
+### What MediaSource API Is
+
+`MediaSource` is a browser API designed specifically for feeding streaming media to an HTML `<audio>` or `<video>` element. Instead of requiring a complete file, you push chunks to it as they arrive. The browser stitches them together and plays them continuously.
+
+The key components:
+
+**`MediaSource`** — the top-level object. You create one, set it as the `src` of an `<audio>` element via `URL.createObjectURL(mediaSource)`, and wait for the `sourceopen` event.
+
+**`SourceBuffer`** — created inside the `MediaSource` via `mediaSource.addSourceBuffer(mimeType)`. This is where you push audio data using `sourceBuffer.appendBuffer(bytes)`. The browser accumulates chunks internally and plays them continuously through the audio element.
+
+The browser knows that a streaming WebM file's first chunk establishes the header and all subsequent chunks are continuation data. `MediaSource` was designed exactly for this use case — it is the technology behind HTTP Live Streaming (HLS), MPEG-DASH, and other adaptive streaming formats. It correctly handles WebM/Opus streaming because streaming WebM is a first-class use case for `MediaSource`.
+
+### What the `sequence` Mode Means
+
+When you create a `SourceBuffer`, you can set its `mode` property to either `'segments'` or `'sequence'`:
+
+- **`'segments'` mode** (default): The browser uses the internal timestamps embedded in the WebM clusters to place each chunk at the correct position in the timeline. Requires that chunks carry correct, valid timestamps.
+
+- **`'sequence'` mode**: The browser ignores any internal timestamps in the chunks and instead plays them in the order they are appended, assigning timestamps automatically based on the duration of previously appended audio.
+
+We set `sourceBuffer.mode = 'sequence'` because:
+1. We always receive and append chunks in the correct chronological order (the server echoes them back in order).
+2. The chunks may not carry reliable timestamps if the streaming WebM was not produced from the beginning.
+3. `'sequence'` mode is the correct mode for streamed audio where you always append in order and do not need random access or seeking.
+
+### Why the `updateend` Event and Queue Are Necessary
+
+`SourceBuffer` processes one `appendBuffer` call at a time. Internally, it must parse the WebM cluster, decode the Opus frames, and hand them to the browser's audio pipeline before it is ready for the next chunk. While this is happening, `sourceBuffer.updating` is `true`.
+
+If you call `appendBuffer` again while `sourceBuffer.updating === true`, the browser throws an `InvalidStateError`. This is not a bug — it is by design. The buffer has a processing pipeline that must finish before accepting more input.
+
+The `updateend` event fires on the `SourceBuffer` when the current `appendBuffer` call finishes — signalling that `sourceBuffer.updating` is now `false` and the next append is safe.
+
+Our implementation handles this with a queue:
+1. If `sourceBuffer.updating === false` when a chunk arrives → append immediately.
+2. If `sourceBuffer.updating === true` → push the chunk to `pendingPlayChunks`.
+3. In the `updateend` handler → check `pendingPlayChunks`, shift the first chunk, and append it.
+4. This drains the queue one chunk at a time without ever double-appending.
+
+We also have a `sourceBufferReady` flag because `addSourceBuffer` is called inside the `sourceopen` event, which fires asynchronously. Chunks can arrive before `sourceopen` fires (especially the very first chunk, which triggers `initMediaSource()` and immediately arrives). Any chunk that arrives before `sourceopen` is pushed to `pendingPlayChunks` and flushed synchronously inside the `sourceopen` handler.
+
+### Why We Disconnect the Original Mic Passthrough When Processing Starts
+
+In the initial Web Audio graph, we connect:
+
+```
+realMic → MediaStreamSourceNode (sourceNode) → MediaStreamDestinationNode (destinationNode)
+```
+
+This pass-through ensures Meet hears the raw microphone while no processing is active.
+
+When processing starts, we additionally route:
+
+```
+MediaSource audio element → createMediaElementSource → MediaStreamDestinationNode (destinationNode)
+```
+
+If we left the direct `sourceNode → destinationNode` connection in place, `destinationNode` would receive **two simultaneous audio inputs**:
+1. The raw microphone audio (direct pass-through)
+2. The server-processed audio from MediaSource
+
+The `MediaStreamDestinationNode` mixes all its inputs together. Meet would therefore receive both your unprocessed voice and the processed voice simultaneously — an echo/doubling effect that makes the call unusable.
+
+By calling `sourceNode.disconnect(destinationNode)` at the moment recording starts, we sever the direct path. Only the MediaSource path remains active. When recording stops, we call `sourceNode.connect(destinationNode)` to restore the direct pass-through, so Meet continues hearing you normally even without processing.
+
+This is the correct pattern for any Web Audio graph where you want to switch between two audio sources: explicitly connect and disconnect rather than mixing both.
+
+---
+
+## 19. The Complete Audio Pipeline — Insertable Streams with Server Processing
+
+### Why the getUserMedia + AudioContext Approach Failed
+
+In the previous architecture we built a Web Audio graph: the real mic stream flowed into a `MediaStreamSourceNode`, through processing nodes, into a `MediaStreamDestinationNode`. We returned `destinationNode.stream` from our `getUserMedia` override.
+
+Meet accepted this `MediaStream` — it is a valid object. But then something unexpected happened. Meet internally extracted the audio track from the stream and passed it to its own **Audio Worklet** — a high-priority audio processing thread that runs in Chrome's audio rendering pipeline. Google Meet's Audio Worklet does not read from the Web Audio node chain we built. It reads from the **underlying hardware device** attached to the track.
+
+A `MediaStreamTrack` backed by a `MediaStreamDestinationNode` has no underlying hardware device. Meet's Audio Worklet found nothing to read. The track appeared to produce silence or, in some configurations, a clone of the real hardware track — bypassing our processing chain entirely. Other participants always heard the original unmodified voice, as if the extension was not installed.
+
+This is not a bug in Meet — it is the correct behaviour. `MediaStreamDestinationNode.stream` is a Web Audio construct designed for Web Audio playback, not for delivering audio to WebRTC tracks in a way that meets Chrome's zero-copy, high-priority media pipeline requirements.
+
+### What the Insertable Streams API Is and Why Google Built It
+
+Before the Insertable Streams API existed (pre-Chrome 94, 2021), there was no way for a web application to modify the audio or video flowing through a `MediaStreamTrack`. You could route audio through a Web Audio graph (as we tried), but as described above, WebRTC did not honour that. You could use a canvas element to modify video frames, but this was slow and did not work for audio at all.
+
+Google shipped the **Insertable Streams API** (also called Breakout Box, Chrome 94, 2021) specifically for:
+- **Real-time video effects**: virtual backgrounds, face filters, augmented reality overlays
+- **Voice processing**: noise cancellation, vocoders, voice changers
+- **End-to-end encryption**: encrypting audio or video frames before WebRTC transmits them (each frame is encrypted client-side, so even the server cannot read it)
+- **Our use case**: intercepting raw mic audio frames, sending them to a server for translation, and feeding back the translated audio — all through a track that Meet's Audio Worklet reads as a genuine mic source
+
+The two core objects this API provides are `MediaStreamTrackProcessor` and `MediaStreamTrackGenerator`. Together they let us "break out" of the `MediaStreamTrack` abstraction, process the raw audio at frame level, and produce a new track that is indistinguishable from a real hardware source.
+
+### What MediaStreamTrackProcessor Is
+
+A `MediaStreamTrackProcessor` takes an existing `MediaStreamTrack` — specifically the audio track from the real microphone — and exposes its contents as a `ReadableStream` of `AudioData` objects.
+
+Think of it as opening the wire. Audio data flows from the microphone hardware into Chrome's audio pipeline. Normally you cannot touch this data directly. `MediaStreamTrackProcessor` taps the wire and exposes every audio frame as a JavaScript object you can read one at a time.
+
+```javascript
+const processor = new MediaStreamTrackProcessor({ track: micTrack });
+const reader = processor.readable.getReader();
+
+// Every call to reader.read() returns the next audio frame
+const { value: audioData } = await reader.read();
+```
+
+Each `AudioData` object you receive contains:
+- **`format`**: `'f32-planar'` — 32-bit floating-point, one plane per channel
+- **`sampleRate`**: `48000` — 48,000 samples per second (Chrome's preferred rate)
+- **`numberOfFrames`**: approximately `128` — the number of audio samples in this chunk
+- **`numberOfChannels`**: `1` for mono microphone input
+- **`timestamp`**: microseconds elapsed since the audio context started
+- **`copyTo(buffer, { planeIndex: 0 })`**: copies the raw float samples to a `Float32Array` you provide
+
+At 128 samples per frame and 48,000 samples per second, frames arrive approximately **375 times per second** — once every 2.67 milliseconds. Each sample is a floating-point number between -1.0 (maximum negative amplitude) and +1.0 (maximum positive amplitude), representing the raw sound wave captured by the microphone.
+
+### What MediaStreamTrackGenerator Is
+
+A `MediaStreamTrackGenerator` is the reverse. It produces a `MediaStreamTrack` whose content is whatever you write into its `WritableStream`. You push `AudioData` frames in; the track plays them out.
+
+```javascript
+const generator = new MediaStreamTrackGenerator({ kind: 'audio' });
+const writer = generator.writable.getWriter();
+
+// Write any AudioData frame — this is what Meet will hear
+await writer.write(someAudioDataFrame);
+```
+
+The critical property: `generator.track` is a **genuine, first-class `MediaStreamTrack`**. It is not a Web Audio API construct. It is not backed by a `MediaStreamDestinationNode`. It is a native track that Chrome's media pipeline treats identically to a track captured from a real microphone hardware device.
+
+When we return `new MediaStream([generator.track])` from our `getUserMedia` override, Meet receives this track. Meet's Audio Worklet reads from `generator.track`. Whatever we write into the generator is exactly what other participants hear. We are not beside the signal chain — we are **in** it.
+
+### The Manual Reader Loop
+
+The most intuitive approach to connecting a processor to a generator is a `TransformStream`:
+
+```javascript
+// This looks clean — but it does not work for our purpose
+processor.readable
+  .pipeThrough(new TransformStream({ transform: myProcessFunction }))
+  .pipeTo(generator.writable);
+```
+
+A `TransformStream` creates a self-contained pipeline. Data enters one end and exits the other. This works when you have a single data source (the mic) feeding a single destination (the generator).
+
+But we have **two sources**: the mic (pass-through audio) and the server (processed audio frames arriving asynchronously). You cannot write to a `WritableStream` from two places at the same time — the stream picks one writer and locks out the other. Calling `generator.writable.getWriter()` after `pipeTo` has locked the stream throws an error.
+
+The solution is the **manual reader loop**:
+
+```javascript
+async function runPipeline() {
+  const reader = processor.readable.getReader();
+  const writer = generator.writable.getWriter();
+  
+  while (true) {
+    const { done, value: audioData } = await reader.read();
+    if (done) break;
+    
+    // Single control point — we decide everything here
+    await handleAudioFrame(audioData, writer);
+  }
+}
+```
+
+This pattern gives us a single `writer` and a single loop. In each iteration of the loop, we read one mic frame and decide whether to write the mic frame unchanged (pass-through) or write a processed frame from the server. One writer. One loop. Clear logic. No concurrent write conflicts.
+
+### AudioData Lifecycle and Memory Management
+
+`AudioData` objects hold raw audio sample data in memory. This memory is allocated outside the JavaScript heap — it belongs to Chrome's media pipeline. When you are done with an `AudioData`, you must call `audioData.close()` to release that memory.
+
+The streams pipeline handles this automatically in normal cases:
+- If you call `writer.write(audioData)`, the stream takes ownership of the frame and closes it when the pipeline is done with it.
+- If you call `controller.enqueue(audioData)` in a `TransformStream`, the same applies.
+
+But in our manual loop, when we decide to **replace** a mic frame with a processed frame from the server, we are not writing the mic frame — we are discarding it. In that case, we must close it ourselves:
+
+```javascript
+if (playingProcessed && processedQueue.length > 0) {
+  const processedFrame = processedQueue.shift();
+  audioData.close(); // CRITICAL — prevents memory leak
+  await writer.write(processedFrame);
+} else {
+  await writer.write(audioData); // stream takes ownership, no close() needed
+}
+```
+
+Failing to close a discarded `AudioData` frame causes a memory leak. At 375 frames per second, even a small leak compounds quickly into hundreds of megabytes of stranded memory over a 30-minute call.
+
+### Sample Accumulation — Why 250ms Chunks
+
+`AudioData` frames arrive at 128 samples each, approximately 375 times per second. Sending a WebSocket message for every 128-sample frame would mean:
+- **375 WebSocket messages per second** — enormous network overhead
+- Messages arriving faster than any server could process them
+- The server would be flooded before it could respond to the first frame
+
+Instead, we **accumulate** frames until we have **12,000 samples** — exactly 250ms of audio at 48kHz:
+
+```
+12000 samples ÷ 48000 samples/second = 0.25 seconds = 250ms
+250ms → 4 WebSocket messages per second
+```
+
+In `handleAudioFrame`, every time processing is enabled, we copy frame samples into an accumulation buffer. When the buffer reaches 12,000 samples, we concatenate all buffered `Float32Array` slices into one combined array and send it to the server. The accumulation buffer resets.
+
+This 250ms chunk timing is not arbitrary — it matches the chunk timing that Deepgram's streaming STT API expects. When we integrate Deepgram, the server receives the same 250ms chunks and passes them directly to Deepgram without reformatting.
+
+### Raw PCM Format for Server Communication
+
+With the Insertable Streams API, we already have raw audio samples as `Float32Array` values (from `audioData.copyTo()`). We send these directly as a JSON array:
+
+```json
+{
+  "type": "audioPCM",
+  "chunkId": 5,
+  "t1": 1714000000321,
+  "samples": [0.0012, -0.0043, 0.0078, ...],
+  "sampleRate": 48000,
+  "numberOfChannels": 1
+}
+```
+
+Why raw PCM instead of encoding to webm/opus first?
+
+1. **Simplicity**: We already have the float values in memory. Encoding them to Opus would require the `AudioEncoder` WebCodecs API, adding complexity and potential failure modes.
+2. **Server compatibility**: Node.js can work with raw float arrays directly — `new Float32Array(samples)` gives us the values immediately, ready to pass to `processPCM`.
+3. **Localhost**: On localhost, bandwidth is not a concern. A 12,000-sample Float32Array is 48KB. At 4 chunks/second, that is 192KB/s — trivial for localhost.
+
+When we deploy to a remote server (e.g., a Mumbai VM for India users), we will add `AudioEncoder` to compress to Opus before sending, reducing bandwidth by approximately 10×. The server receives the same format either way — the PCM samples, either directly or decoded from Opus.
+
+### The Toggle Behavior
+
+The pipeline always runs — the reader loop is started once when `getUserMedia` is called and keeps running for the duration of the call. The `processingEnabled` flag is the only switch:
+
+**OFF (`processingEnabled = false`):**
+Every mic frame is written directly to the generator unchanged. No samples are copied to the accumulation buffer. Nothing is sent to the server. Meet hears the original voice exactly as captured from the microphone. Zero overhead — the loop is trivially fast in the off state.
+
+**ON (`processingEnabled = true`):**
+Every mic frame is still written to the generator (so there is never silence). Additionally, the frame's samples are copied into the accumulation buffer. When the buffer reaches 12,000 samples, the chunk is sent to the server. When the server returns processed samples (`type: 'audioPCM'`), `content.js` forwards them to `injected.js`, which splits them into 128-sample `AudioData` frames and pushes them into `processedQueue`.
+
+In the pipeline loop, when `playingProcessed` is `true` and `processedQueue` is non-empty, we write a processed frame instead of the mic frame (the mic frame is closed). The switch from mic to processed is a **hard cut** — a clean, immediate transition with no blending or crossfade. This is correct for the current implementation. A production version might add a sidechain compressor to duck the mic before the switch and fade in the processed audio, but the hard cut is sufficient to prove the pipeline works.
+
+### The `processPCM` Function — The Single Swappable Function
+
+The entire server is built around one principle: everything is infrastructure except `processPCM`. The WebSocket handler, the backpressure queue, the drain loop, the client tracking — none of that ever needs to change. Only `processPCM` changes.
+
+Current implementation — tanh soft-clip saturation:
+
+```javascript
+function processPCM(samples, pitchSemitones) {
+  const output = new Float32Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    output[i] = Math.tanh(samples[i] * 2.0);
+  }
+  return output;
+}
+```
+
+`Math.tanh(x * 2.0)` is a soft-limiter. It compresses the dynamic range — samples near ±1.0 are pushed toward ±1.0 asymptotically rather than clipping hard. The 2× gain makes the voice noticeably louder and slightly saturated. This is obviously different from the original voice — a clear, audible, subjective proof that server processing is working at all.
+
+Production implementation — voice translation:
+
+```javascript
+async function processPCM(samples, pitchSemitones) {
+  // Step 1: Deepgram Streaming STT
+  const transcript = await deepgramSTT(samples);
+  if (!transcript || transcript.trim() === '') return samples; // silence
+  
+  // Step 2: Gemini Flash translation
+  const translated = await geminiFlash(transcript, targetLanguage);
+  
+  // Step 3: Deepgram Aura TTS
+  const audioSamples = await deepgramAuraTTS(translated, 48000);
+  return audioSamples; // Float32Array
+}
+```
+
+The function signature — `(Float32Array samples, number pitchSemitones) → Float32Array` — is permanent. The server handler never changes. Only the body of `processPCM` changes when real AI processing is integrated.
+
+### Why This Is the Correct Production Architecture
+
+Every component of the current implementation is in the final product, unchanged:
+
+| Component | Status in demo | Status in production |
+|---|---|---|
+| `MediaStreamTrackProcessor` | Reads real mic frames | Same — never changes |
+| `MediaStreamTrackGenerator` | Outputs to Meet | Same — never changes |
+| Manual reader loop | Controls what Meet hears | Same — never changes |
+| 250ms PCM accumulation | Buffers frames for server | Same — matches Deepgram |
+| `processedQueue` + hard switch | Plays server audio | Enhanced with crossfade |
+| WebSocket pipeline | Carries PCM samples | Same — just different content |
+| `processPCM` | tanh saturation demo | Deepgram+Gemini+TTS body |
+| Backpressure queue | Drops stale chunks | Same — prevents lag buildup |
+| Latency measurement (t1–t4) | Measures demo latency | Measures AI API latency |
+| Dashboard broadcasting | Shows demo timing | Shows full pipeline timing |
+
+The demo is considered working when: toggle ON → speak → the other participant hears a noticeably louder and slightly saturated version of your voice with approximately 250ms of delay. This 250ms delay is the round-trip time of one chunk through the pipeline (extension → server → back). When deployed with real AI processing, the delay will be the sum of Deepgram STT latency (~300ms) + Gemini translation latency (~200ms) + Deepgram TTS latency (~300ms) + network time — typically 800–1500ms total, which is acceptable for voice translation where the listener expects a slight delay.
